@@ -27,6 +27,11 @@ from typing import Iterable, Optional, Set, Type, Union
 
 from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, model_validator
 
+try:
+    from metagpt.rag.engines.simple import SimpleEngine
+except ImportError:
+    SimpleEngine = None
+
 from metagpt.actions import Action, ActionOutput
 from metagpt.actions.action_node import ActionNode
 from metagpt.actions.add_requirement import UserRequirement
@@ -103,6 +108,7 @@ class RoleContext(BaseModel):
     memory: Memory = Field(default_factory=Memory)
     # long_term_memory: LongTermMemory = Field(default_factory=LongTermMemory)
     working_memory: Memory = Field(default_factory=Memory)
+    rag_engine: Optional[SimpleEngine] = Field(default=None, exclude=True)
     state: int = Field(default=-1)  # -1 indicates initial or termination state where todo is None
     todo: Action = Field(default=None, exclude=True)
     watch: set[str] = Field(default_factory=set)
@@ -363,6 +369,16 @@ class Role(BaseRole, SerializationMixin, ContextMixin, BaseModel):
             n_states=len(self.states) - 1,
             previous_state=self.rc.state,
         )
+
+        if SimpleEngine and self.rc.rag_engine:
+            query = "\n".join([str(m.content) for m in self.rc.history])
+            if query:  # ensure query is not empty
+                try:
+                    rag_output = await self.rc.rag_engine.aquery(query)
+                    if rag_output:
+                        prompt += f"\n\n## RAG Engine Output\n{rag_output}\n"
+                except Exception as e:
+                    logger.error(f"Error querying RAG engine: {e}")
 
         next_state = await self.llm.aask(prompt)
         next_state = extract_state_value_from_output(next_state)

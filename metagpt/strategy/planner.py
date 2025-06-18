@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 import json
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
+
+try:
+    from metagpt.rag.engines.simple import SimpleEngine
+except ImportError:
+    SimpleEngine = None
+
+try:
+    from metagpt.roles.role import RoleContext
+except ImportError:
+    RoleContext = None
 
 from metagpt.actions.di.ask_review import AskReview, ReviewConst
 from metagpt.actions.di.write_plan import (
@@ -61,10 +71,11 @@ class Planner(BaseModel):
         default_factory=Memory
     )  # memory for working on each task, discarded each time a task is done
     auto_run: bool = False
+    role_context: Optional[RoleContext] = Field(default=None, exclude=True)
 
-    def __init__(self, goal: str = "", plan: Plan = None, **kwargs):
+    def __init__(self, goal: str = "", plan: Plan = None, role_context: Optional[RoleContext] = None, **kwargs):
         plan = plan or Plan(goal=goal)
-        super().__init__(plan=plan, **kwargs)
+        super().__init__(plan=plan, role_context=role_context, **kwargs)
 
     @property
     def current_task(self):
@@ -80,8 +91,30 @@ class Planner(BaseModel):
 
         plan_confirmed = False
         while not plan_confirmed:
-            context = self.get_useful_memories()
-            rsp = await WritePlan().run(context, max_tasks=max_tasks)
+            context_msg_list = self.get_useful_memories() # Renamed to avoid conflict
+
+            if RoleContext and self.role_context and SimpleEngine and self.role_context.rag_engine:
+                # Construct query for RAG engine
+                rag_query_elements = [self.plan.goal]  # Start with the main goal
+                # Add content from existing context messages
+                for msg in context_msg_list:
+                    if hasattr(msg, 'content'):
+                        rag_query_elements.append(str(msg.content))
+
+                rag_query = "\n".join(rag_query_elements)
+
+                if rag_query:
+                    try:
+                        rag_output = await self.role_context.rag_engine.aquery(rag_query)
+                        if rag_output:
+                            # Add RAG output as a new message at the beginning of the context
+                            rag_message = Message(content=f"## RAG Engine Output for Planning\n{rag_output}", role="system") # Or another appropriate role
+                            context_msg_list.insert(0, rag_message)
+                            logger.info("Successfully incorporated RAG output into planning context.")
+                    except Exception as e:
+                        logger.error(f"Error querying RAG engine during planning: {e}")
+
+            rsp = await WritePlan().run(context_msg_list, max_tasks=max_tasks) # Pass the potentially augmented context
             self.working_memory.add(Message(content=rsp, role="assistant", cause_by=WritePlan))
 
             # precheck plan before asking reviews

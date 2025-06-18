@@ -10,6 +10,7 @@ from enum import Enum
 from metagpt.actions.action import Action
 from metagpt.actions.action_output import ActionOutput
 from metagpt.actions.add_requirement import UserRequirement
+from metagpt.actions.query_rag import QueryRAG
 from metagpt.actions.debug_error import DebugError
 from metagpt.actions.design_api import WriteDesign
 from metagpt.actions.design_api_review import DesignReview
@@ -48,10 +49,11 @@ class ActionType(Enum):
     EXECUTE_NB_CODE = ExecuteNbCode
     WRITE_ANALYSIS_CODE = WriteAnalysisCode
     WRITE_PLAN = WritePlan
-
+    QUERY_RAG = QueryRAG
 
 __all__ = [
     "ActionType",
     "Action",
     "ActionOutput",
+    "QueryRAG",
 ]
