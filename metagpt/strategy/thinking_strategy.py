@@ -12,8 +12,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from metagpt.llm import LLM
 from metagpt.logs import logger
 from metagpt.provider.base_llm import BaseLLM
-from metagpt.strategy.base import ThoughtNode, ThoughtTree
-from metagpt.strategy.tot_schema import MethodSelect, Strategy, ThoughtSolverConfig
+from metagpt.strategy.base import ThoughtNode, ThoughtTree # Assuming ThoughtNode might be used by BFSSolver/DFSSolver directly
+from metagpt.strategy.thinking_schema import MethodSelect, Strategy, ThoughtSolverConfig
+from metagpt.strategy.got import GoTSolver
+from metagpt.strategy.got_schema import GoTStrategy
 from metagpt.utils.common import CodeParser
 
 OUTPUT_FORMAT = """
@@ -232,10 +234,10 @@ class MCTSSolver(ThoughtSolverBase):
         raise NotImplementedError
 
 
-class TreeofThought(BaseModel):
+class ThinkingStrategy(BaseModel):
     config: ThoughtSolverConfig = Field(default_factory=ThoughtSolverConfig)
     solver: ThoughtSolverBase = Field(default_factory=ThoughtSolverBase)
-    strategy: Strategy = Field(default=Strategy.BFS)
+    strategy: Strategy | GoTStrategy = Field(default=Strategy.BFS) # Updated type hint
 
     class Config:
         arbitrary_types_allowed = True
@@ -244,7 +246,7 @@ class TreeofThought(BaseModel):
         super().__init__(**kwargs)
         self._initialize_solver(self.strategy)
 
-    def _initialize_solver(self, strategy):
+    def _initialize_solver(self, strategy: Strategy | GoTStrategy):
         """
         Initialize the solver based on the chosen strategy.
 
@@ -260,8 +262,12 @@ class TreeofThought(BaseModel):
             self.solver = DFSSolver(config=self.config)
         elif strategy == Strategy.MCTS:
             self.solver = MCTSSolver(config=self.config)
+        elif isinstance(strategy, GoTStrategy): # Check if it's a GoT strategy
+            self.solver = GoTSolver(config=self.config) # Instantiate GoTSolver
+            # Potentially pass strategy to GoTSolver if it needs to know the specific GoT method
+            # self.solver.current_strategy = strategy
         else:
-            raise NotImplementedError(f"Invalid strategy: {strategy}, only support BFS/DFS/MCTS currently!")
+            raise NotImplementedError(f"Invalid strategy: {strategy}, only support BFS/DFS/MCTS and GoT strategies currently!")
 
     async def solve(self, init_prompt=""):
         """

@@ -47,6 +47,10 @@ from metagpt.schema import (
 from metagpt.strategy.planner import Planner
 from metagpt.utils.common import any_to_name, any_to_str, role_raise_decorator
 from metagpt.utils.repair_llm_raw_output import extract_state_value_from_output
+from metagpt.agent.reasoners.base_reasoner import BaseReasoner
+from metagpt.agent.reasoners.got_reasoner import GraphOfThoughtsReasoner
+from metagpt.agent.reasoners.simple_cot_reasoner import SimpleCotReasoner
+
 
 PREFIX_TEMPLATE = """You are a {profile}, named {name}, your goal is {goal}. """
 CONSTRAINT_TEMPLATE = "the constraint is {constraints}. "
@@ -111,6 +115,7 @@ class RoleContext(BaseModel):
         RoleReactMode.REACT
     )  # see `Role._set_react_mode` for definitions of the following two attributes
     max_react_loop: int = 1
+    reasoner: Optional[SerializeAsAny["BaseReasoner"]] = Field(default=None, exclude=True) # type: ignore
 
     @property
     def important_memory(self) -> list[Message]:
@@ -178,6 +183,51 @@ class Role(BaseRole, SerializationMixin, ContextMixin, BaseModel):
 
         if self.latest_observed_msg:
             self.recovered = True
+
+        # Initialize reasoner if not already done (e.g. by deserialization)
+        if hasattr(self.rc, 'reasoner') and not self.rc.reasoner: # Check if reasoner attribute exists
+            # Assuming self.llm.config provides necessary llm_config (like api_key, model)
+            # and self.config provides agent_config (like max_thoughts, max_depth)
+            llm_config_for_reasoner = {
+                "api_key": self.llm.config.api_key if hasattr(self.llm.config, 'api_key') else None,
+                "model": self.llm.config.model if hasattr(self.llm.config, 'model') else "gpt-3.5-turbo", # Default
+                "base_url": self.llm.config.base_url if hasattr(self.llm.config, 'base_url') else None,
+                "temperature": self.llm.config.temperature if hasattr(self.llm.config, 'temperature') else 0.7,
+                "max_tokens": self.llm.config.max_token if hasattr(self.llm.config, 'max_token') else 1500,
+            }
+            # agent_config might come from self.config (ConfigManager) or specific role settings
+            # Common agent config keys, specific reasoners might pick what they need.
+            agent_config_for_reasoner = {
+                "max_thoughts": self.config.get("max_thoughts", 5),  # For GoT
+                "max_depth": self.config.get("max_depth", 3),        # For GoT
+                # Add other generic or specific config as needed
+            }
+
+            reasoning_method = self.config.get("reasoning_method", "none") # Default to no reasoner
+
+            try:
+                if reasoning_method == "GoT":
+                    self.rc.reasoner = GraphOfThoughtsReasoner(
+                        llm_config=llm_config_for_reasoner,
+                        agent_config=agent_config_for_reasoner # GoT uses max_thoughts, max_depth
+                    )
+                    logger.info(f"Role {self.name} initialized GraphOfThoughtsReasoner.")
+                elif reasoning_method == "CoT":
+                    # SimpleCotReasoner expects the llm instance directly, not llm_config dict
+                    self.rc.reasoner = SimpleCotReasoner(
+                        llm=self.llm, # Pass the role's LLM instance
+                        agent_config=agent_config_for_reasoner
+                    )
+                    logger.info(f"Role {self.name} initialized SimpleCotReasoner.")
+                elif reasoning_method == "none":
+                    self.rc.reasoner = None
+                    logger.info(f"Role {self.name} has no specific reasoner configured.")
+                else:
+                    logger.warning(f"Unknown reasoning_method '{reasoning_method}' for Role {self.name}. No reasoner initialized.")
+                    self.rc.reasoner = None
+            except Exception as e:
+                logger.error(f"Failed to initialize reasoner '{reasoning_method}' for Role {self.name}: {e}")
+                self.rc.reasoner = None
 
     @property
     def todo(self) -> Action:
@@ -380,20 +430,116 @@ class Role(BaseRole, SerializationMixin, ContextMixin, BaseModel):
 
     async def _act(self) -> Message:
         logger.info(f"{self._setting}: to do {self.rc.todo}({self.rc.todo.name})")
-        response = await self.rc.todo.run(self.rc.history)
-        if isinstance(response, (ActionOutput, ActionNode)):
+
+        # Unified handling for reasoners adhering to BaseReasoner interface
+        if self.rc.reasoner and self.rc.todo:
+            logger.info(f"Role {self.name} using {type(self.rc.reasoner).__name__} for action {self.rc.todo.name}")
+
+            problem_description = f"Execute action: {self.rc.todo.name}. "
+            # Try to get a more specific instruction if the action has it
+            action_instruction = ""
+            if hasattr(self.rc.todo, 'i_context') and self.rc.todo.i_context: # General instruction for the action
+                 action_instruction = self.rc.todo.i_context
+            elif hasattr(self.rc.todo, 'instruction') and self.rc.todo.instruction: # Specific instruction from ActionNode
+                 action_instruction = self.rc.todo.instruction
+
+            if action_instruction:
+                 problem_description += f"Instruction: {action_instruction}. "
+
+            if self.rc.history and self.rc.history[-1].content:
+                problem_description += f"Based on latest message: {self.rc.history[-1].content}"
+            else:
+                problem_description += "No prior history immediately available for this action."
+
+            initial_context = {"role_name": self.name, "role_profile": self.profile}
+            if self.rc.history:
+                # Provide a summary of recent history if needed, be mindful of token limits
+                history_summary = "\n".join([f"{m.sent_from if m.sent_from else m.role}: {m.content[:100]}" for m in self.rc.history[-2:]])
+                initial_context["history_summary"] = history_summary
+
+            # Ensure reasoner is set up for the current problem
+            self.rc.reasoner.setup(problem_description=problem_description, initial_context=initial_context)
+
+            solution_content = "No solution found by reasoner." # Default
+            instruct_content = None # Default
+
+            try:
+                # Loop for reasoning steps if applicable.
+                # For SimpleCot, it finishes in one step. GoT might loop internally via controller.run().
+                # This loop is a generic structure; specific reasoners control their own completion via is_finished().
+                current_reasoning_steps = 0
+                max_reasoning_steps = self.config.get("max_reasoning_steps", 1) # Default to 1 step if not defined
+
+                while not self.rc.reasoner.is_finished() and current_reasoning_steps < max_reasoning_steps:
+                    step_output = await self.rc.reasoner.execute_reasoning_step()
+                    logger.info(f"Reasoner step {current_reasoning_steps + 1} output: {step_output}")
+                    current_reasoning_steps += 1
+                    if step_output.get("status") == "error":
+                        solution_content = f"Error in reasoning step: {step_output.get('message')}"
+                        break # Exit loop on error
+
+                solution = await self.rc.reasoner.get_current_solution()
+
+                if solution is None:
+                    logger.warning(f"{type(self.rc.reasoner).__name__} for {self.rc.todo.name} did not produce a solution.")
+                # Check if solution is a dict (like GoT thought) or a simple string (like CoT)
+                elif isinstance(solution, dict) and 'value' in solution:
+                    solution_content = solution['value']
+                elif isinstance(solution, str):
+                    solution_content = solution
+                else:
+                    solution_content = str(solution)
+
+                # Attempt to format the solution according to the action's expected output type
+                output_cls = self.rc.todo.action_outcls_map.get(self.rc.todo.name, ActionOutput)
+                try:
+                    if output_cls != ActionOutput and isinstance(solution_content, str):
+                        # Try to parse if it's a Pydantic model and solution_content is a string (e.g. JSON)
+                        parsed_response = output_cls.model_validate_json(solution_content)
+                        response_content = getattr(parsed_response, 'content', solution_content)
+                        instruct_content = getattr(parsed_response, 'instruct_content', None)
+                    elif isinstance(solution_content, output_cls): # if solution is already the target type
+                        parsed_response = solution_content
+                        response_content = getattr(parsed_response, 'content', str(parsed_response))
+                        instruct_content = getattr(parsed_response, 'instruct_content', None)
+                    else:
+                        response_content = solution_content # Fallback
+                except Exception as e:
+                    logger.warning(f"Failed to parse reasoner solution into {output_cls.__name__}: {e}. Using raw solution content.")
+                    response_content = solution_content
+
+            except Exception as e:
+                logger.error(f"Error during {type(self.rc.reasoner).__name__} execution for {self.rc.todo.name}: {e}")
+                response_content = f"Error during reasoning: {e}"
+
             msg = AIMessage(
-                content=response.content,
-                instruct_content=response.instruct_content,
+                content=response_content,
+                instruct_content=instruct_content,
                 cause_by=self.rc.todo,
                 sent_from=self,
+                metadata={"reasoner_used": type(self.rc.reasoner).__name__}
             )
-        elif isinstance(response, Message):
-            msg = response
-        else:
-            msg = AIMessage(content=response or "", cause_by=self.rc.todo, sent_from=self)
-        self.rc.memory.add(msg)
 
+        else: # Fallback to original behavior if no reasoner or no todo
+            logger.info(f"Role {self.name} using standard action execution for {self.rc.todo.name if self.rc.todo else 'N/A'}")
+            if not self.rc.todo:
+                logger.warning(f"{self._setting}: No todo action defined.")
+                return AIMessage(content="No action to perform.", cause_by=Action, sent_from=self)
+
+            response = await self.rc.todo.run(self.rc.history)
+            if isinstance(response, (ActionOutput, ActionNode)):
+                msg = AIMessage(
+                    content=response.content,
+                    instruct_content=response.instruct_content,
+                    cause_by=self.rc.todo,
+                    sent_from=self,
+                )
+            elif isinstance(response, Message):
+                msg = response
+            else:
+                msg = AIMessage(content=response or "", cause_by=self.rc.todo, sent_from=self)
+
+        self.rc.memory.add(msg)
         return msg
 
     async def _observe(self) -> int:
@@ -572,8 +718,55 @@ class Role(BaseRole, SerializationMixin, ContextMixin, BaseModel):
         Export SDK API, used by AgentStore RPC.
         The exported `act` function
         """
-        msg = await self._act()
-        return ActionOutput(content=msg.content, instruct_content=msg.instruct_content)
+        msg = await self._act() # msg is an AIMessage
+
+        # The _act method now potentially populates msg.instruct_content with a Pydantic model
+        # or msg.content with the primary output.
+        # ActionOutput expects 'content' (usually string) and 'instruct_content' (usually a Pydantic model / dict)
+
+        final_content = ""
+        final_instruct_content = None
+
+        # Try to determine the best way to populate ActionOutput based on what _act returned in AIMessage
+        if isinstance(msg.instruct_content, BaseModel):
+            # If instruct_content is already a Pydantic model (as can be the case with newer ActionOutput handling)
+            final_instruct_content = msg.instruct_content
+            # Try to get a string representation for final_content
+            if hasattr(msg.instruct_content, 'content') and isinstance(getattr(msg.instruct_content, 'content'), str):
+                 final_content = getattr(msg.instruct_content, 'content')
+            elif isinstance(msg.content, str): # Fallback to msg.content if instruct_content has no 'content' field
+                 final_content = msg.content
+            else: # If all else fails, stringify the instruct_content model
+                 final_content = str(msg.instruct_content)
+
+        elif isinstance(msg.content, str):
+            final_content = msg.content
+            # If instruct_content is a dict (e.g., from older ActionOutput conversion or specific actions)
+            if isinstance(msg.instruct_content, dict):
+                final_instruct_content = msg.instruct_content
+            # If instruct_content is a string, it's unusual for ActionOutput, but we'll assign it if content is already set.
+            # Or, it could be that msg.content is a simple string and instruct_content is also a string (less common).
+            # This case is ambiguous; for now, if msg.content is string, it's primary.
+
+        elif isinstance(msg.content, BaseModel):
+            # If msg.content is a Pydantic model, it's likely the main structured output.
+            final_instruct_content = msg.content
+            # Try to get a string representation for final_content
+            if hasattr(msg.content, 'content') and isinstance(getattr(msg.content, 'content'), str):
+                final_content = getattr(msg.content, 'content')
+            else:
+                final_content = str(msg.content)
+
+        else: # Fallback if msg.content is not a string or BaseModel (e.g., None)
+            final_content = str(msg.content) if msg.content is not None else ""
+            if isinstance(msg.instruct_content, dict): # Pass through dict instruct_content
+                final_instruct_content = msg.instruct_content
+            # If instruct_content is a string and content was None, maybe it's the primary content
+            elif isinstance(msg.instruct_content, str) and not final_content:
+                final_content = msg.instruct_content
+
+
+        return ActionOutput(content=final_content, instruct_content=final_instruct_content)
 
     @property
     def action_description(self) -> str:

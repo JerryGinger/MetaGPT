@@ -6,3 +6,40 @@ llm:
   model: "gpt-4-turbo"  # or gpt-3.5-turbo
   base_url: "https://api.openai.com/v1"  # or forward url / other llm url
   api_key: "YOUR_API_KEY"
+
+# Example Role configurations (add specific roles under a top-level key like 'roles' or 'agents')
+# roles:
+#   solver_for_agi:
+#     _role_class: "metagpt.roles.got_solver_role.GoTSolverRole"
+#     name: "AGISolver"
+#     profile: "GoTSolver"
+#     goal: "Research and outline potential paths to Artificial General Intelligence."
+#     constraints: "Provide a concise overview with actionable insights."
+#     # Configuration for GoTReasoningAction used by GoTSolverRole
+#     got_max_iterations: 3
+#     got_num_dummy_thoughts: 2 # Number of dummy thoughts generated per step by the placeholder
+#     # Watch events or how the role is triggered would be part of a larger agent/team setup
+#     # e.g., if using a Team orchestrator or specific event triggers in your main script:
+#     # watch_events: ["ResearchAGIEvent"]
+#
+#   another_role_using_cot:
+#     _role_class: "metagpt.roles.some_other_role.SomeOtherRole" # Assuming a generic role or specific one
+#     name: "SimpleTaskSolver"
+#     profile: "CoTRole"
+#     goal: "Solve a straightforward problem with step-by-step thinking."
+#     reasoning_method: "CoT" # This would be read by Role to initialize SimpleCotReasoner
+#     # No specific CoT params here as SimpleCotReasoner is basic, but could be added.
+
+# To use these role configurations, you would typically load them in your main script
+# and instantiate roles based on these settings, often within a Team or Environment.
+# For example, if using a Team:
+# my_team = Team()
+# my_team.hire([AGISolver(config_from_yaml_section), ...]) # Simplified
+# Or a Role directly:
+# solver_config = meta_config.get_role_config("solver_for_agi")
+# agi_solver = GoTSolverRole(**solver_config) # Pass dict directly
+#
+# The `reasoning_method` config for a role (like "GoT" or "CoT") is read by the
+# Role class itself in `_process_role_extra` to instantiate the correct reasoner.
+# Other parameters like `got_max_iterations` are accessed via `self.config.get(...)`
+# within the Role (e.g., in `GoTSolverRole._act`).
